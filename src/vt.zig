@@ -514,7 +514,7 @@ pub const Parser = struct {
 
 /// Bulk-feed a data buffer, using a fast path for contiguous printable ASCII
 /// in ground state (bypasses Action union overhead).
-pub fn feedBulk(parser: *Parser, data: []const u8, term: *Term, writer_fd: ?std.posix.fd_t) void {
+pub fn feedBulk(parser: *Parser, data: []const u8, term: *Term, writer_fd: ?i32) void {
     var i: usize = 0;
     // Hoist charset/insert_mode checks — only change on escape sequences, not mid-ASCII-run
     var ascii_fast_eligible = (term.charsets[term.charset] == .us_ascii and !term.insert_mode);
@@ -815,7 +815,7 @@ pub fn executeAction(action: Action, term: *Term) void {
     executeActionWithFd(action, term, null);
 }
 
-pub fn executeActionWithFd(action: Action, term: *Term, writer_fd: ?std.posix.fd_t) void {
+pub fn executeActionWithFd(action: Action, term: *Term, writer_fd: ?i32) void {
     _ = writer_fd; // VT responses now buffered in term.vt_response_buf
     switch (action) {
         .print => |cp| handlePrint(cp, term),

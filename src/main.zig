@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const posix = @import("posix.zig");
 const is_macos = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 const linux = if (is_linux) std.os.linux else struct {};
+const windows = if (is_windows) @import("windows.zig") else struct {};
 const config = @import("config");
 
 const Term = @import("term.zig").Term;
@@ -20,12 +22,14 @@ const Backend = switch (config.backend) {
     .x11 => @import("backend/x11.zig").X11Backend,
     .wayland => @import("backend/wayland.zig").WaylandBackend,
     .macos => @import("backend/macos.zig").MacosBackend,
+    .windows => @import("backend/windows.zig").WindowsBackend,
 };
 
 const BackendEvent = switch (config.backend) {
     .x11 => @import("backend/x11.zig").Event,
     .wayland => @import("backend/wayland.zig").Event,
     .macos => @import("backend/macos.zig").Event,
+    .windows => @import("backend/windows.zig").Event,
     .fbdev => void,
 };
 
@@ -33,6 +37,7 @@ const BackendMouseEvent = switch (config.backend) {
     .x11 => @import("backend/x11.zig").MouseEvent,
     .wayland => @import("backend/wayland.zig").MouseEvent,
     .macos => @import("backend/macos.zig").MouseEvent,
+    .windows => @import("backend/windows.zig").MouseEvent,
     .fbdev => void,
 };
 const MouseButton = if (config.backend == .fbdev) enum { none } else BackendMouseEvent.Button;
@@ -58,7 +63,11 @@ const FontType = font_mod.FontBlob(@embedFile("font_blob"));
 // =============================================================================
 
 fn setupSignals() !posix.fd_t {
-    if (is_linux) {
+    if (is_windows) {
+        // Windows has no POSIX signals or signalfd; child exit is detected by
+        // the ConPTY output pipe closing.
+        return -1;
+    } else if (is_linux) {
         var mask = linux.sigemptyset();
         linux.sigaddset(&mask, linux.SIG.CHLD);
         linux.sigaddset(&mask, linux.SIG.TERM);
@@ -112,7 +121,10 @@ fn setupSignals() !posix.fd_t {
 // =============================================================================
 
 fn createTimerFd(interval_ns: u64) !posix.fd_t {
-    if (is_linux) {
+    if (is_windows) {
+        // The Windows event loop derives the blink tick from its wait timeout.
+        return -1;
+    } else if (is_linux) {
         const fd_raw = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
         const fd_isize: isize = @bitCast(fd_raw);
         if (fd_isize < 0) return error.TimerFdFailed;
@@ -271,7 +283,10 @@ const PtyWriteQueue = struct {
 };
 
 fn setPtyWriteInterest(evloop_fd: i32, pty_fd: posix.fd_t, enabled: bool) void {
-    if (is_linux) {
+    if (is_windows) {
+        // The ConPTY writer thread owns flow control; there is no EPOLLOUT.
+        return;
+    } else if (is_linux) {
         epollSetPtyEvents(evloop_fd, pty_fd, enabled);
     } else {
         kqueueSetPtyWrite(evloop_fd, pty_fd, enabled);
@@ -530,12 +545,12 @@ fn applyCursorBlinkTimerTick(
 // Signal handler
 // =============================================================================
 
-const SIG_CHLD: u32 = if (is_linux) @backingInt(linux.SIG.CHLD) else @backingInt(std.c.SIG.CHLD);
-const SIG_TERM: u32 = if (is_linux) @backingInt(linux.SIG.TERM) else @backingInt(std.c.SIG.TERM);
-const SIG_INT: u32 = if (is_linux) @backingInt(linux.SIG.INT) else @backingInt(std.c.SIG.INT);
-const SIG_HUP: u32 = if (is_linux) @backingInt(linux.SIG.HUP) else @backingInt(std.c.SIG.HUP);
-const SIG_USR1: u32 = if (is_linux) @backingInt(linux.SIG.USR1) else @backingInt(std.c.SIG.USR1);
-const SIG_USR2: u32 = if (is_linux) @backingInt(linux.SIG.USR2) else @backingInt(std.c.SIG.USR2);
+const SIG_CHLD: u32 = if (is_linux) @backingInt(linux.SIG.CHLD) else if (is_macos) @backingInt(std.c.SIG.CHLD) else 0;
+const SIG_TERM: u32 = if (is_linux) @backingInt(linux.SIG.TERM) else if (is_macos) @backingInt(std.c.SIG.TERM) else 0;
+const SIG_INT: u32 = if (is_linux) @backingInt(linux.SIG.INT) else if (is_macos) @backingInt(std.c.SIG.INT) else 0;
+const SIG_HUP: u32 = if (is_linux) @backingInt(linux.SIG.HUP) else if (is_macos) @backingInt(std.c.SIG.HUP) else 0;
+const SIG_USR1: u32 = if (is_linux) @backingInt(linux.SIG.USR1) else if (is_macos) @backingInt(std.c.SIG.USR1) else 0;
+const SIG_USR2: u32 = if (is_linux) @backingInt(linux.SIG.USR2) else if (is_macos) @backingInt(std.c.SIG.USR2) else 0;
 
 fn handleSignal(sig_fd: posix.fd_t, signo_override: ?u32, backend: *Backend) bool {
     const signo: u32 = signo_override orelse blk: {
@@ -589,92 +604,96 @@ fn handleSignal(sig_fd: posix.fd_t, signo_override: ?u32, backend: *Backend) boo
 /// Returns false if the event loop should stop (close event or write failure).
 /// Dispatch clipboard copy via external tool (xclip for X11, wl-copy for Wayland).
 /// Non-blocking: forks a child process and writes data to its stdin.
-fn dispatchClipboardCopy(data: []const u8) void {
-    const argv: [*:null]const ?[*:0]const u8 = switch (config.backend) {
-        .x11 => &[_:null]?[*:0]const u8{ "xclip", "-selection", "clipboard" },
-        .wayland => &[_:null]?[*:0]const u8{"wl-copy"},
-        .macos => &[_:null]?[*:0]const u8{"/usr/bin/pbcopy"},
-        else => return,
-    };
+fn dispatchClipboardCopy(data: []const u8, backend: *Backend) void {
+    if (config.backend == .windows) {
+        backend.setClipboard(data);
+    } else if (config.backend != .fbdev) {
+        const argv: [*:null]const ?[*:0]const u8 = switch (config.backend) {
+            .x11 => &[_:null]?[*:0]const u8{ "xclip", "-selection", "clipboard" },
+            .wayland => &[_:null]?[*:0]const u8{"wl-copy"},
+            .macos => &[_:null]?[*:0]const u8{"/usr/bin/pbcopy"},
+            .windows, .fbdev => return,
+        };
 
-    // SIGPIPE is blocked (Linux) or ignored (macOS) process-wide at
-    // setupSignals(), so write() to a dead clipboard helper simply
-    // returns EPIPE instead of terminating us.
-    const pipe_fds = posix.pipe() catch return;
-    const pid = posix.fork() catch {
+        // SIGPIPE is blocked (Linux) or ignored (macOS) process-wide at
+        // setupSignals(), so write() to a dead clipboard helper simply
+        // returns EPIPE instead of terminating us.
+        const pipe_fds = posix.pipe() catch return;
+        const pid = posix.fork() catch {
+            posix.close(pipe_fds[0]);
+            posix.close(pipe_fds[1]);
+            return;
+        };
+
+        if (pid == 0) {
+            // Child: redirect stdin from pipe read end.
+            // All other inherited fds (PTY master, signalfd, epoll_fd, evdev,
+            // backend socket) carry O_CLOEXEC and are closed automatically by
+            // the kernel on execvpeZ.  The pipe fds themselves are also opened
+            // with O_CLOEXEC (see posix.pipe), but the read end we dup2 onto
+            // stdin: dup2 clears the FD_CLOEXEC flag, so the child inherits a
+            // readable stdin as intended.  The write end stays closed-on-exec.
+            posix.dup2(pipe_fds[0], 0) catch posix.exit(1);
+            posix.close(pipe_fds[0]);
+            posix.close(pipe_fds[1]);
+
+            // Reset the inherited signal mask: setupSignals() blocks
+            // SIGCHLD/TERM/INT/HUP (+ SIGPIPE on Linux) process-wide, and the
+            // exec'd helper must not run with those permanently blocked.
+            if (is_linux) {
+                var empty_set = linux.sigemptyset();
+                _ = linux.sigprocmask(linux.SIG.SETMASK, &empty_set, null);
+            } else {
+                var empty_set = std.mem.zeroes(std.c.sigset_t);
+                _ = std.c.sigprocmask(std.c.SIG.SETMASK, &empty_set, null);
+            }
+
+            // Use minimal environment to avoid LD_PRELOAD/PATH hijacking
+            var display_env_buf: [128]u8 = undefined;
+            var wayland_env_buf: [128]u8 = undefined;
+            var xdg_env_buf: [256]u8 = undefined;
+            var xauth_env_buf: [256]u8 = undefined;
+            var clip_env: [8:null]?[*:0]const u8 = @splat(null);
+            var ci: usize = 0;
+            clip_env[ci] = "PATH=/usr/local/bin:/usr/bin:/bin";
+            ci += 1;
+            if (posix.getenv("DISPLAY")) |v| {
+                clip_env[ci] = (std.fmt.bufPrintSentinel(&display_env_buf, "DISPLAY={s}", .{v}, 0) catch null);
+                if (clip_env[ci] != null) ci += 1;
+            }
+            if (posix.getenv("XAUTHORITY")) |v| {
+                clip_env[ci] = (std.fmt.bufPrintSentinel(&xauth_env_buf, "XAUTHORITY={s}", .{v}, 0) catch null);
+                if (clip_env[ci] != null) ci += 1;
+            }
+            if (posix.getenv("WAYLAND_DISPLAY")) |v| {
+                clip_env[ci] = (std.fmt.bufPrintSentinel(&wayland_env_buf, "WAYLAND_DISPLAY={s}", .{v}, 0) catch null);
+                if (clip_env[ci] != null) ci += 1;
+            }
+            if (posix.getenv("XDG_RUNTIME_DIR")) |v| {
+                clip_env[ci] = (std.fmt.bufPrintSentinel(&xdg_env_buf, "XDG_RUNTIME_DIR={s}", .{v}, 0) catch null);
+                if (clip_env[ci] != null) ci += 1;
+            }
+            const clip_envp: [*:null]const ?[*:0]const u8 = &clip_env;
+            _ = posix.execvpeZ(
+                argv[0].?,
+                argv,
+                clip_envp,
+            ) catch {};
+            posix.exit(1);
+        }
+
+        // Parent: write data to pipe write end, close read end immediately.
+        // Loop on short writes — payloads larger than the pipe capacity would
+        // otherwise be silently truncated.
         posix.close(pipe_fds[0]);
-        posix.close(pipe_fds[1]);
-        return;
-    };
-
-    if (pid == 0) {
-        // Child: redirect stdin from pipe read end.
-        // All other inherited fds (PTY master, signalfd, epoll_fd, evdev,
-        // backend socket) carry O_CLOEXEC and are closed automatically by
-        // the kernel on execvpeZ.  The pipe fds themselves are also opened
-        // with O_CLOEXEC (see posix.pipe), but the read end we dup2 onto
-        // stdin: dup2 clears the FD_CLOEXEC flag, so the child inherits a
-        // readable stdin as intended.  The write end stays closed-on-exec.
-        posix.dup2(pipe_fds[0], 0) catch posix.exit(1);
-        posix.close(pipe_fds[0]);
-        posix.close(pipe_fds[1]);
-
-        // Reset the inherited signal mask: setupSignals() blocks
-        // SIGCHLD/TERM/INT/HUP (+ SIGPIPE on Linux) process-wide, and the
-        // exec'd helper must not run with those permanently blocked.
-        if (is_linux) {
-            var empty_set = linux.sigemptyset();
-            _ = linux.sigprocmask(linux.SIG.SETMASK, &empty_set, null);
-        } else {
-            var empty_set = std.mem.zeroes(std.c.sigset_t);
-            _ = std.c.sigprocmask(std.c.SIG.SETMASK, &empty_set, null);
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = posix.write(pipe_fds[1], data[off..]) catch break;
+            if (n == 0) break;
+            off += n;
         }
-
-        // Use minimal environment to avoid LD_PRELOAD/PATH hijacking
-        var display_env_buf: [128]u8 = undefined;
-        var wayland_env_buf: [128]u8 = undefined;
-        var xdg_env_buf: [256]u8 = undefined;
-        var xauth_env_buf: [256]u8 = undefined;
-        var clip_env: [8:null]?[*:0]const u8 = @splat(null);
-        var ci: usize = 0;
-        clip_env[ci] = "PATH=/usr/local/bin:/usr/bin:/bin";
-        ci += 1;
-        if (posix.getenv("DISPLAY")) |v| {
-            clip_env[ci] = (std.fmt.bufPrintSentinel(&display_env_buf, "DISPLAY={s}", .{v}, 0) catch null);
-            if (clip_env[ci] != null) ci += 1;
-        }
-        if (posix.getenv("XAUTHORITY")) |v| {
-            clip_env[ci] = (std.fmt.bufPrintSentinel(&xauth_env_buf, "XAUTHORITY={s}", .{v}, 0) catch null);
-            if (clip_env[ci] != null) ci += 1;
-        }
-        if (posix.getenv("WAYLAND_DISPLAY")) |v| {
-            clip_env[ci] = (std.fmt.bufPrintSentinel(&wayland_env_buf, "WAYLAND_DISPLAY={s}", .{v}, 0) catch null);
-            if (clip_env[ci] != null) ci += 1;
-        }
-        if (posix.getenv("XDG_RUNTIME_DIR")) |v| {
-            clip_env[ci] = (std.fmt.bufPrintSentinel(&xdg_env_buf, "XDG_RUNTIME_DIR={s}", .{v}, 0) catch null);
-            if (clip_env[ci] != null) ci += 1;
-        }
-        const clip_envp: [*:null]const ?[*:0]const u8 = &clip_env;
-        _ = posix.execvpeZ(
-            argv[0].?,
-            argv,
-            clip_envp,
-        ) catch {};
-        posix.exit(1);
+        posix.close(pipe_fds[1]); // EOF signals end of data to child
     }
-
-    // Parent: write data to pipe write end, close read end immediately.
-    // Loop on short writes — payloads larger than the pipe capacity would
-    // otherwise be silently truncated.
-    posix.close(pipe_fds[0]);
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = posix.write(pipe_fds[1], data[off..]) catch break;
-        if (n == 0) break;
-        off += n;
-    }
-    posix.close(pipe_fds[1]); // EOF signals end of data to child
 }
 
 fn handleBackendEvent(
@@ -911,7 +930,7 @@ fn handleBackendEvent(
 
             // Shift held → terminal selection (bypass app mouse capture)
             if (mouse_ev.modifiers.shift) {
-                handleTerminalSelection(term, mouse_ev, cx, cy);
+                handleTerminalSelection(term, mouse_ev, cx, cy, backend);
                 return true;
             }
 
@@ -925,7 +944,7 @@ fn handleBackendEvent(
                 }
             } else {
                 // No app mouse mode → terminal selection
-                handleTerminalSelection(term, mouse_ev, cx, cy);
+                handleTerminalSelection(term, mouse_ev, cx, cy, backend);
             }
         },
         .copy_selection => {
@@ -933,12 +952,12 @@ fn handleBackendEvent(
                 var clipboard_buf: [16384]u8 = undefined;
                 const text = extractSelectionText(term, &clipboard_buf);
                 if (text.len > 0) {
-                    dispatchClipboardCopy(text);
+                    dispatchClipboardCopy(text, backend);
                 }
             }
         },
         .new_window => {
-            if (config.backend == .macos) backend.openNewWindow();
+            if (config.backend == .macos or config.backend == .windows) backend.openNewWindow();
         },
         .close => {
             return false;
@@ -1086,7 +1105,7 @@ fn extractSelectionText(term: *const Term, buf: []u8) []const u8 {
     return buf[0..pos];
 }
 
-fn handleTerminalSelection(term: *Term, ev: BackendMouseEvent, cx: u32, cy: u32) void {
+fn handleTerminalSelection(term: *Term, ev: BackendMouseEvent, cx: u32, cy: u32, backend: *Backend) void {
     switch (ev.action) {
         .press => switch (ev.button) {
             .left => {
@@ -1132,7 +1151,7 @@ fn handleTerminalSelection(term: *Term, ev: BackendMouseEvent, cx: u32, cy: u32)
                         var clipboard_buf: [16384]u8 = undefined;
                         const text = extractSelectionText(term, &clipboard_buf);
                         if (text.len > 0) {
-                            dispatchClipboardCopy(text);
+                            dispatchClipboardCopy(text, backend);
                         }
                     }
                 }
@@ -1201,7 +1220,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     const allocator = if (builtin.mode == .debug)
         gpa.allocator()
-    else if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos)
+    else if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos or config.backend == .windows)
         std.heap.c_allocator
     else
         std.heap.page_allocator;
@@ -1244,12 +1263,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var backend = switch (config.backend) {
         .fbdev => try Backend.init(allocator),
         .x11 => try Backend.init(embed_window),
-        .wayland, .macos => try Backend.init(),
+        .wayland, .macos, .windows => try Backend.init(),
     };
     defer backend.deinit();
 
-    // 1b. Post-init for X11/Wayland/macOS (XKB + XIM, needs stable self pointer)
-    if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos) {
+    // 1b. Post-init for X11/Wayland/macOS/Windows (XKB + XIM, stable self pointer)
+    if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos or config.backend == .windows) {
         backend.postInit();
     }
 
@@ -1269,7 +1288,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer term.deinit();
 
     // 6. Spawn PTY
-    var pty = try Pty.spawn(@intCast(cols), @intCast(rows), config.shell, exec_argv);
+    var pty = Pty.spawn(@intCast(cols), @intCast(rows), config.shell, exec_argv) catch |err| {
+        if (is_windows) {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "Could not start the shell: {s}\n\nNative Windows support requires Windows 10 1809 or newer (ConPTY).",
+                .{@errorName(err)},
+            ) catch "Could not start the shell.";
+            windows.messageBox("zt - shell startup failed", msg);
+        }
+        return err;
+    };
     defer pty.deinit();
 
     // 7. Setup signals
@@ -1280,8 +1310,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const timer_fd = try createTimerFd(500_000_000);
     defer if (timer_fd >= 0) posix.close(timer_fd);
 
-    // 9. Setup event loop (epoll on Linux, kqueue on macOS)
-    const evloop_fd: i32 = if (is_linux) blk: {
+    // 9. Setup event loop (epoll on Linux, kqueue on macOS, Win32 messages on Windows)
+    const evloop_fd: i32 = if (is_windows) 0 else if (is_linux) blk: {
         const raw = linux.epoll_create1(linux.EPOLL.CLOEXEC);
         const isize_val: isize = @bitCast(raw);
         if (isize_val < 0) return error.EpollCreateFailed;
@@ -1289,9 +1319,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else blk: {
         break :blk try posix.kqueue();
     };
-    defer posix.close(evloop_fd);
+    defer if (!is_windows) posix.close(evloop_fd);
 
-    if (is_linux) {
+    if (is_windows) {
+        // The Windows loop waits on the ConPTY reader event and its message
+        // queue (MsgWaitForMultipleObjectsEx); no descriptor registration.
+    } else if (is_linux) {
         try epollAdd(evloop_fd, pty.master_fd, @backingInt(EpollTag.pty));
         try epollAdd(evloop_fd, sig_fd, @backingInt(EpollTag.signal));
         try epollAdd(evloop_fd, timer_fd, @backingInt(EpollTag.timer));
@@ -1349,7 +1382,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var parser = vt.Parser{};
     var running = true;
     var mod_state: input.Modifiers = .{};
-    var pty_buf: [config.pty_buf_size]u8 = undefined;
+    var pty_buf = try allocator.alloc(u8, config.pty_buf_size);
+    defer allocator.free(pty_buf);
     var cursor_visible_blink = true;
     var cursor_blink_active = true; // false after idle timeout — stops blink rendering
     // false while unfocused: skip cursor timer toggles (avoids stale idle blink + extra wakeups)
@@ -1364,6 +1398,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_render_ns: i128 = 0;
     var bytes_since_render: usize = 0;
     var sync_update_start_ns: i128 = 0; // timestamp when sync_update was first seen
+    var last_blink_ns: i128 = posix.nanoTimestamp();
+    var child_exit_ns: i128 = 0;
 
     while (running) {
         const loop_now = posix.nanoTimestamp();
@@ -1401,7 +1437,91 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
-        if (is_linux) {
+        if (is_windows) {
+            // ---- Windows message + ConPTY dispatch ----
+            // Deliver already-queued window messages before blocking.
+            if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
+                running = false;
+                continue;
+            }
+
+            // Block for PTY output, window messages, or the next frame tick.
+            // Cap the wait at 16 ms so cursor blink and animation stay alive
+            // even when no window message arrives.
+            const wait_ms: u32 = if (event_timeout < 0) 16 else @intCast(@min(event_timeout, 16));
+            const handles = [_]windows.c.HANDLE{pty.waitHandle()};
+            _ = windows.c.MsgWaitForMultipleObjectsEx(
+                1,
+                &handles,
+                wait_ms,
+                windows.QS_ALLINPUT,
+                windows.MWMO_INPUTAVAILABLE,
+            );
+
+            // Pump messages; window callbacks push events into the backend queue.
+            if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
+                running = false;
+                continue;
+            }
+
+            // Drain all available PTY output produced while we waited.
+            var drained: usize = 0;
+            while (drained < config.pty_buf_size) {
+                const bytes_read = pty.read(pty_buf) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    else => {
+                        running = false;
+                        break;
+                    },
+                };
+                if (bytes_read == 0) {
+                    running = false;
+                    break;
+                }
+                bytes_since_render += bytes_read;
+                drained += bytes_read;
+                if (term.selection != null) {
+                    term.clearSelection();
+                }
+                vt.feedBulk(&parser, pty_buf[0..bytes_read], &term, pty.master_fd);
+                if (term.vt_response_len > 0) {
+                    if (!ptyBufferedWrite(&pty, term.vt_response_buf[0..term.vt_response_len], &write_queue, evloop_fd)) {
+                        running = false;
+                        break;
+                    }
+                    term.vt_response_len = 0;
+                }
+                if (write_queue.len() > config.pty_buf_size / 2) break;
+            }
+
+            // ConPTY keeps the output pipe open after the child exits. Close
+            // the pseudo console so the reader reaches EOF, then keep draining
+            // until the final frame has been consumed (with a safety timeout).
+            if (pty.childExited()) {
+                if (child_exit_ns == 0) {
+                    child_exit_ns = posix.nanoTimestamp();
+                    pty.closeConsole();
+                } else if (posix.nanoTimestamp() - child_exit_ns > 2_000_000_000) {
+                    running = false;
+                }
+            } else {
+                child_exit_ns = 0;
+            }
+
+            // Cursor blink tick (no timerfd on Windows).
+            const blink_now = posix.nanoTimestamp();
+            if (blink_now - last_blink_ns >= 500_000_000) {
+                last_blink_ns = blink_now;
+                applyCursorBlinkTimerTick(
+                    &term,
+                    backend_focused,
+                    last_input_ns,
+                    &cursor_blink_active,
+                    &cursor_visible_blink,
+                    cursor_idle_timeout_ns,
+                );
+            }
+        } else if (is_linux) {
             // X11/Wayland/macos backends can buffer events internally even when their
             // fd is no longer readable. Drain a bounded amount every loop so input
             // never appears "stuck" waiting for unrelated socket traffic.
@@ -1437,7 +1557,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // PTY readable — drain all available data before rendering
                         if (ev.events & linux.EPOLL.IN != 0) {
                             while (true) {
-                                const bytes_read = pty.read(&pty_buf) catch |err| switch (err) {
+                                const bytes_read = pty.read(pty_buf) catch |err| switch (err) {
                                     error.WouldBlock => break,
                                     else => {
                                         running = false;
@@ -1555,7 +1675,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // Bound each drain so sustained output cannot starve Cocoa.
                         var drained: usize = 0;
                         while (drained < config.pty_buf_size) {
-                            const bytes_read = pty.read(&pty_buf) catch |err| switch (err) {
+                            const bytes_read = pty.read(pty_buf) catch |err| switch (err) {
                                 error.WouldBlock => break,
                                 else => {
                                     running = false;
@@ -1632,7 +1752,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (running) {
             var extra_total: usize = 0;
             while (extra_total < config.pty_buf_size) {
-                const extra = pty.read(&pty_buf) catch |err| switch (err) {
+                const extra = pty.read(pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
                         // EIO/HUP: child exited; terminate the event loop.
@@ -1673,7 +1793,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // OSC 52: copy to system clipboard via external tool
         if (term.osc52_pending) {
             term.osc52_pending = false;
-            dispatchClipboardCopy(term.osc52_buf[0..term.osc52_len]);
+            dispatchClipboardCopy(term.osc52_buf[0..term.osc52_len], &backend);
         }
 
         // Mark old cursor position dirty if cursor moved
@@ -1948,4 +2068,5 @@ test {
     _ = @import("scrollback.zig");
     if (config.backend == .x11) _ = @import("backend/x11.zig");
     if (config.backend == .macos) _ = @import("backend/macos.zig");
+    if (config.backend == .windows) _ = @import("backend/windows.zig");
 }

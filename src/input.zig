@@ -199,6 +199,111 @@ fn buildMacosTable() [128]u16 {
     return table;
 }
 
+/// Windows virtual-key code → Linux evdev keycode translation.
+/// Only the keys zt's terminal keymap understands are mapped; everything else
+/// returns 0. Printable text always arrives through WM_CHAR/WM_IME_COMPOSITION,
+/// so this table is used for special keys and Ctrl/Alt combinations.
+pub fn windowsToEvdev(vk: u16) u16 {
+    if (vk >= windows_to_evdev_table.len) return 0;
+    return windows_to_evdev_table[vk];
+}
+
+const windows_to_evdev_table: [256]u16 = buildWindowsTable();
+
+fn buildWindowsTable() [256]u16 {
+    var table: [256]u16 = @splat(0);
+    // Letters (virtual-key codes are ASCII uppercase)
+    table['A'] = KEY.A;
+    table['B'] = KEY.B;
+    table['C'] = KEY.C;
+    table['D'] = KEY.D;
+    table['E'] = KEY.E;
+    table['F'] = KEY.F;
+    table['G'] = KEY.G;
+    table['H'] = KEY.H;
+    table['I'] = KEY.I;
+    table['J'] = KEY.J;
+    table['K'] = KEY.K;
+    table['L'] = KEY.L;
+    table['M'] = KEY.M;
+    table['N'] = KEY.N;
+    table['O'] = KEY.O;
+    table['P'] = KEY.P;
+    table['Q'] = KEY.Q;
+    table['R'] = KEY.R;
+    table['S'] = KEY.S;
+    table['T'] = KEY.T;
+    table['U'] = KEY.U;
+    table['V'] = KEY.V;
+    table['W'] = KEY.W;
+    table['X'] = KEY.X;
+    table['Y'] = KEY.Y;
+    table['Z'] = KEY.Z;
+    // Digits
+    table['0'] = KEY.@"0";
+    table['1'] = KEY.@"1";
+    table['2'] = KEY.@"2";
+    table['3'] = KEY.@"3";
+    table['4'] = KEY.@"4";
+    table['5'] = KEY.@"5";
+    table['6'] = KEY.@"6";
+    table['7'] = KEY.@"7";
+    table['8'] = KEY.@"8";
+    table['9'] = KEY.@"9";
+    // OEM punctuation
+    table[0xBA] = KEY.SEMICOLON; // VK_OEM_1 ;:
+    table[0xBB] = KEY.EQUAL; // VK_OEM_PLUS =+
+    table[0xBC] = KEY.COMMA; // VK_OEM_COMMA ,<
+    table[0xBD] = KEY.MINUS; // VK_OEM_MINUS -_
+    table[0xBE] = KEY.DOT; // VK_OEM_PERIOD .>
+    table[0xBF] = KEY.SLASH; // VK_OEM_2 /?
+    table[0xC0] = KEY.GRAVE; // VK_OEM_3 `~
+    table[0xDB] = KEY.LEFTBRACE; // VK_OEM_4 [{
+    table[0xDC] = KEY.BACKSLASH; // VK_OEM_5 \|
+    table[0xDD] = KEY.RIGHTBRACE; // VK_OEM_6 ]}
+    table[0xDE] = KEY.APOSTROPHE; // VK_OEM_7 '"
+    // Control / whitespace
+    table[0x08] = KEY.BACKSPACE;
+    table[0x09] = KEY.TAB;
+    table[0x0D] = KEY.ENTER;
+    table[0x1B] = KEY.ESC;
+    table[0x20] = KEY.SPACE;
+    // Modifiers
+    table[0xA0] = KEY.LEFTSHIFT;
+    table[0xA1] = KEY.RIGHTSHIFT;
+    table[0xA2] = KEY.LEFTCTRL;
+    table[0xA3] = KEY.RIGHTCTRL;
+    table[0xA4] = KEY.LEFTALT;
+    table[0xA5] = KEY.RIGHTALT;
+    table[0x5B] = KEY.LEFTMETA;
+    table[0x5C] = KEY.RIGHTMETA;
+    // Navigation
+    table[0x21] = KEY.PAGEUP;
+    table[0x22] = KEY.PAGEDOWN;
+    table[0x23] = KEY.END;
+    table[0x24] = KEY.HOME;
+    table[0x25] = KEY.LEFT;
+    table[0x26] = KEY.UP;
+    table[0x27] = KEY.RIGHT;
+    table[0x28] = KEY.DOWN;
+    table[0x2D] = KEY.INSERT;
+    table[0x2E] = KEY.DELETE;
+    // Function keys
+    table[0x70] = KEY.F1;
+    table[0x71] = KEY.F2;
+    table[0x72] = KEY.F3;
+    table[0x73] = KEY.F4;
+    table[0x74] = KEY.F5;
+    table[0x75] = KEY.F6;
+    table[0x76] = KEY.F7;
+    table[0x77] = KEY.F8;
+    table[0x78] = KEY.F9;
+    table[0x79] = KEY.F10;
+    table[0x7A] = KEY.F11;
+    table[0x7B] = KEY.F12;
+    return table;
+}
+
 pub const Modifiers = packed struct(u8) {
     shift: bool = false,
     ctrl: bool = false,
@@ -665,7 +770,6 @@ test "Input: unknown keycode returns empty" {
 }
 
 test "macOS keycode translation: common keys" {
-    // kVK_ANSI_A (0x00) → KEY_A (30)
     try testing.expectEqual(@as(u16, KEY.A), macosToEvdev(0x00));
     // kVK_Return (0x24) → KEY_ENTER (28)
     try testing.expectEqual(@as(u16, KEY.ENTER), macosToEvdev(0x24));
@@ -683,4 +787,16 @@ test "macOS keycode translation: common keys" {
     try testing.expectEqual(@as(u16, 0), macosToEvdev(0x7F));
     // Out of range → 0
     try testing.expectEqual(@as(u16, 0), macosToEvdev(0xFF));
+}
+
+test "Windows virtual-key translation: common keys" {
+    try testing.expectEqual(@as(u16, KEY.A), windowsToEvdev('A'));
+    try testing.expectEqual(@as(u16, KEY.ENTER), windowsToEvdev(0x0D));
+    try testing.expectEqual(@as(u16, KEY.BACKSPACE), windowsToEvdev(0x08));
+    try testing.expectEqual(@as(u16, KEY.ESC), windowsToEvdev(0x1B));
+    try testing.expectEqual(@as(u16, KEY.UP), windowsToEvdev(0x26));
+    try testing.expectEqual(@as(u16, KEY.F5), windowsToEvdev(0x74));
+    try testing.expectEqual(@as(u16, KEY.SEMICOLON), windowsToEvdev(0xBA));
+    try testing.expectEqual(@as(u16, 0), windowsToEvdev(0x5D));
+    try testing.expectEqual(@as(u16, 0), windowsToEvdev(0x100));
 }

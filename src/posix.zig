@@ -9,10 +9,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const is_windows = builtin.os.tag == .windows;
+const windows = if (is_windows) @import("windows.zig") else struct {};
 
 // Re-exports (unchanged in 0.16) --------------------------------------------
-pub const fd_t = std.posix.fd_t;
-pub const pid_t = std.posix.pid_t;
+// Windows' std.posix.fd_t is a HANDLE; zt only passes -1/0/2 to this shim on
+// Windows, so keep a small integer descriptor type on every platform.
+pub const fd_t = if (is_windows) i32 else std.posix.fd_t;
+pub const pid_t = if (is_windows) i32 else std.posix.pid_t;
 pub const mode_t = std.posix.mode_t;
 pub const Kevent = std.posix.Kevent;
 pub const timespec = std.posix.timespec;
@@ -93,6 +97,13 @@ const write_map = [_]ErrnoEntry{
 };
 
 pub inline fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
+    if (is_windows) {
+        if (fd == 2) {
+            windows.writeStderr(bytes);
+            return bytes.len;
+        }
+        return error.Unexpected;
+    }
     while (true) {
         const rc = if (builtin.os.tag == .macos) std.c.write(fd, bytes.ptr, bytes.len) else linux.write(fd, bytes.ptr, bytes.len);
         const e = if (builtin.os.tag == .macos) std.c.errno(rc) else linux.errno(rc);
@@ -103,6 +114,7 @@ pub inline fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
 }
 
 pub inline fn close(fd: fd_t) void {
+    if (is_windows) return; // Windows handles are not CRT file descriptors.
     if (builtin.os.tag == .macos) {
         _ = std.c.close(fd);
     } else {
@@ -187,6 +199,7 @@ pub inline fn dup2(old_fd: fd_t, new_fd: fd_t) Dup2Error!void {
 }
 
 pub inline fn exit(status: u8) noreturn {
+    if (is_windows) std.process.exit(status);
     if (builtin.os.tag == .macos) std.c._exit(status);
     linux.exit_group(status);
 }
@@ -199,6 +212,10 @@ pub var environ: std.process.Environ = .empty;
 /// Block the current thread for `nanoseconds`. Replacement for
 /// `std.Thread.sleep` (removed in Zig 0.16).
 pub inline fn sleep(nanoseconds: u64) void {
+    if (is_windows) {
+        windows.sleep(nanoseconds);
+        return;
+    }
     var req: timespec = .{
         .sec = @intCast(nanoseconds / std.time.ns_per_s),
         .nsec = @intCast(nanoseconds % std.time.ns_per_s),
@@ -220,6 +237,7 @@ pub inline fn sleep(nanoseconds: u64) void {
 /// MONOTONIC is preferable for the delta-only callers in zt and avoids
 /// NTP/DST-jump artefacts.
 pub inline fn nanoTimestamp() i128 {
+    if (is_windows) return windows.nanoTimestamp();
     var ts: timespec = undefined;
     if (builtin.os.tag == .macos) {
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -230,6 +248,7 @@ pub inline fn nanoTimestamp() i128 {
 }
 
 pub inline fn getenv(key: []const u8) ?[]const u8 {
+    if (is_windows) return windows.getenv(key);
     return environ.getPosix(key);
 }
 
@@ -497,19 +516,22 @@ pub inline fn connect(sockfd: fd_t, sock_addr: *const anyopaque, len: u32) Conne
 }
 
 test "POSIX pipe flags and read/write round trip" {
-    const fds = try pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
-    defer close(fds[0]);
-    defer close(fds[1]);
-    const nonblock: u32 = @bitCast(O{ .NONBLOCK = true });
-    for (fds) |fd| {
-        try std.testing.expect((try fcntl(fd, F.GETFD, 0) & 1) != 0);
-        try std.testing.expect((@as(u32, @bitCast(try fcntl(fd, F.GETFL, 0))) & nonblock) != 0);
+    if (is_windows) return error.SkipZigTest;
+    if (!is_windows) {
+        const fds = try pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+        defer close(fds[0]);
+        defer close(fds[1]);
+        const nonblock: u32 = @bitCast(O{ .NONBLOCK = true });
+        for (fds) |fd| {
+            try std.testing.expect((try fcntl(fd, F.GETFD, 0) & 1) != 0);
+            try std.testing.expect((@as(u32, @bitCast(try fcntl(fd, F.GETFL, 0))) & nonblock) != 0);
+        }
+        var buffer: [4]u8 = undefined;
+        try std.testing.expectError(error.WouldBlock, read(fds[0], &buffer));
+        try std.testing.expectEqual(@as(usize, 4), try write(fds[1], "test"));
+        try std.testing.expectEqual(@as(usize, 4), try read(fds[0], &buffer));
+        try std.testing.expectEqualStrings("test", &buffer);
     }
-    var buffer: [4]u8 = undefined;
-    try std.testing.expectError(error.WouldBlock, read(fds[0], &buffer));
-    try std.testing.expectEqual(@as(usize, 4), try write(fds[1], "test"));
-    try std.testing.expectEqual(@as(usize, 4), try read(fds[0], &buffer));
-    try std.testing.expectEqualStrings("test", &buffer);
 }
 
 test "POSIX monotonic time advances during sleep" {
@@ -519,17 +541,22 @@ test "POSIX monotonic time advances during sleep" {
 }
 
 test "POSIX exec reports missing absolute paths" {
-    const args = [_:null]?[*:0]const u8{"/zt-does-not-exist"};
-    const env = [_:null]?[*:0]const u8{};
-    try std.testing.expectEqual(error.FileNotFound, execvpeZ(args[0].?, &args, &env));
+    if (is_windows) return error.SkipZigTest;
+    if (!is_windows) {
+        const args = [_:null]?[*:0]const u8{"/zt-does-not-exist"};
+        const env = [_:null]?[*:0]const u8{};
+        try std.testing.expectEqual(error.FileNotFound, execvpeZ(args[0].?, &args, &env));
+    }
 }
 
 test "macOS kqueue is close-on-exec and accepts an empty poll" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    const fd = try kqueue();
-    defer close(fd);
-    try std.testing.expect((try fcntl(fd, F.GETFD, 0) & 1) != 0);
-    var events: [1]Kevent = undefined;
-    const timeout: timespec = .{ .sec = 0, .nsec = 0 };
-    try std.testing.expectEqual(@as(usize, 0), try kevent(fd, &.{}, &events, &timeout));
+    if (builtin.os.tag == .macos) {
+        const fd = try kqueue();
+        defer close(fd);
+        try std.testing.expect((try fcntl(fd, F.GETFD, 0) & 1) != 0);
+        var events: [1]Kevent = undefined;
+        const timeout: timespec = .{ .sec = 0, .nsec = 0 };
+        try std.testing.expectEqual(@as(usize, 0), try kevent(fd, &.{}, &events, &timeout));
+    }
 }

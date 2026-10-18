@@ -31,19 +31,27 @@ pub fn build(b: *std.Build) void {
     else
         null;
 
-    const backend_opt = b.option([]const u8, "backend", "Rendering backend: fbdev, x11, wayland, or macos") orelse if (target.result.os.tag == .macos) "macos" else "fbdev";
+    const backend_opt = b.option([]const u8, "backend", "Rendering backend: fbdev, x11, wayland, macos, or windows") orelse switch (target.result.os.tag) {
+        .macos => "macos",
+        .windows => "windows",
+        else => "fbdev",
+    };
     const is_x11 = std.mem.eql(u8, backend_opt, "x11");
     const is_wayland = std.mem.eql(u8, backend_opt, "wayland");
     const is_macos = std.mem.eql(u8, backend_opt, "macos");
-    if (!is_x11 and !is_wayland and !is_macos and !std.mem.eql(u8, backend_opt, "fbdev")) {
-        std.debug.panic("invalid -Dbackend='{s}'; expected fbdev, x11, wayland, or macos", .{backend_opt});
+    const is_windows = std.mem.eql(u8, backend_opt, "windows");
+    if (!is_x11 and !is_wayland and !is_macos and !is_windows and !std.mem.eql(u8, backend_opt, "fbdev")) {
+        std.debug.panic("invalid -Dbackend='{s}'; expected fbdev, x11, wayland, macos, or windows", .{backend_opt});
     }
 
     if (is_macos != (target.result.os.tag == .macos)) {
         @panic("macOS targets require -Dbackend=macos; Linux backends require a Linux target");
     }
-    if (!is_macos and target.result.os.tag != .linux) {
-        @panic("zt supports Linux and macOS targets");
+    if (is_windows != (target.result.os.tag == .windows)) {
+        @panic("Windows targets require -Dbackend=windows; other backends require Linux or macOS");
+    }
+    if (!is_macos and !is_windows and target.result.os.tag != .linux) {
+        @panic("zt supports Linux, macOS, and Windows targets");
     }
 
     const keymap_opt = b.option([]const u8, "keymap", "Keyboard layout: us or jp (default: us)") orelse "us";
@@ -90,13 +98,14 @@ pub fn build(b: *std.Build) void {
     }
     const scrollback_lines_opt = b.option(u32, "scrollback_lines", "Scrollback rows for main screen (0 disables, default 10000)") orelse 10000;
     const alt_screen_wheel_scrollback_opt = b.option(bool, "alt_screen_wheel_scrollback", "Make the mouse wheel scroll the alt-screen scrollback ring instead of arrow keys (default: false)") orelse false;
-    const shell_opt_raw = b.option([]const u8, "shell", "Shell path (default: /bin/zsh on macOS, /bin/sh on Linux)") orelse if (is_macos) "/bin/zsh" else "/bin/sh";
+    const shell_opt_raw = b.option([]const u8, "shell", "Shell path (default: /bin/zsh on macOS, /bin/sh on Linux, cmd.exe on Windows)") orelse if (is_macos) "/bin/zsh" else if (is_windows) "cmd.exe" else "/bin/sh";
     const shell_opt: [:0]const u8 = b.allocator.dupeSentinel(u8, shell_opt_raw, 0) catch @panic("OOM");
 
     const options = b.addOptions();
     options.addOption(bool, "use_x11", is_x11);
     options.addOption(bool, "use_wayland", is_wayland);
     options.addOption(bool, "use_macos", is_macos);
+    options.addOption(bool, "use_windows", is_windows);
     options.addOption(bool, "macos_gui_tests", b.option(bool, "macos_gui_tests", "Run Cocoa integration tests (requires a macOS desktop session)") orelse false);
     options.addOption(bool, "use_jp_keymap", use_jp_keymap);
     options.addOption(u32, "scale", scale_opt);
@@ -131,6 +140,9 @@ pub fn build(b: *std.Build) void {
         .name = "zt",
         .root_module = exe_mod,
     });
+
+    // zt owns its own window; a console window would flash on startup.
+    if (is_windows) exe.subsystem = .windows;
 
     if (is_x11) {
         exe_mod.linkSystemLibrary("xcb", .{});
@@ -203,6 +215,19 @@ pub fn build(b: *std.Build) void {
         });
         if (sysroot_inc) |p| c_pty_macos.addIncludePath(p);
         exe_mod.addImport("c_pty_macos", c_pty_macos.createModule());
+    } else if (is_windows) {
+        exe_mod.linkSystemLibrary("user32", .{});
+        exe_mod.linkSystemLibrary("gdi32", .{});
+        exe_mod.linkSystemLibrary("imm32", .{});
+        exe_mod.link_libc = true;
+
+        const c_windows = b.addTranslateC(.{
+            .root_source_file = b.path("src/c_windows.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        exe_mod.addImport("c_windows", c_windows.createModule());
     }
 
     b.installArtifact(exe);
@@ -276,6 +301,19 @@ pub fn build(b: *std.Build) void {
         });
         if (sysroot_inc) |p| c_pty_macos_test.addIncludePath(p);
         test_mod.addImport("c_pty_macos", c_pty_macos_test.createModule());
+    } else if (is_windows) {
+        test_mod.linkSystemLibrary("user32", .{});
+        test_mod.linkSystemLibrary("gdi32", .{});
+        test_mod.linkSystemLibrary("imm32", .{});
+        test_mod.link_libc = true;
+
+        const c_windows_test = b.addTranslateC(.{
+            .root_source_file = b.path("src/c_windows.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        test_mod.addImport("c_windows", c_windows_test.createModule());
     }
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

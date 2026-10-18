@@ -7,9 +7,10 @@ pub const Backend = enum {
     x11,
     wayland,
     macos,
+    windows,
 };
 
-pub const backend: Backend = if (build_options.use_macos) .macos else if (build_options.use_wayland) .wayland else if (build_options.use_x11) .x11 else .fbdev;
+pub const backend: Backend = if (build_options.use_macos) .macos else if (build_options.use_windows) .windows else if (build_options.use_wayland) .wayland else if (build_options.use_x11) .x11 else .fbdev;
 
 pub const default_fg: u8 = 7;
 pub const default_bg: u8 = 0;

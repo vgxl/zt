@@ -4,8 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/Platform-macOS_14+-black?logo=apple&logoColor=white)](https://github.com/midasdf/zt/releases/tag/v0.11.0)
 [![Linux](https://img.shields.io/badge/Platform-Linux-yellow?logo=linux&logoColor=white)](https://kernel.org)
+[![Windows](https://img.shields.io/badge/Platform-Windows_10_1809+-0078D6?logo=windows&logoColor=white)](https://learn.microsoft.com/windows/console/creating-a-pseudoconsole-session)
 
-A small terminal emulator for **macOS and Linux**, written in Zig. Native Cocoa/AppKit on Mac; framebuffer, X11 (XCB + SHM), and Wayland (pure Zig wire protocol, no libwayland) on Linux. No GPU required.
+A small terminal emulator for **macOS, Linux, and Windows**, written in Zig. Native Cocoa/AppKit on Mac; native Win32/GDI on Windows; framebuffer, X11 (XCB + SHM), and Wayland (pure Zig wire protocol, no libwayland) on Linux. No GPU required.
+
+**Native Windows support** — zt runs on Windows 10 1809+ with a Win32/GDI window and ConPTY, without external runtime dependencies.
 
 **New in 0.11.0: Zig 0.17 support** — source builds, font tools, CI, and release packaging now use Zig 0.17.0. Multiple Mac terminals remain supported: open a new window with Cmd+N, the Dock's right-click menu, or by opening `zt.app` again. Native Mac support covers Apple Silicon and Intel on macOS 14+. Download a Finder-launchable `zt.app` from the [0.11.0 release](https://github.com/midasdf/zt/releases/tag/v0.11.0), or [build with Homebrew](#macos-backend).
 
@@ -25,7 +28,7 @@ Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=Rel
 
 ### Rendering
 
-- **Four backends** — framebuffer (no X11/Wayland), XCB + SHM under X11, pure Zig Wayland client (no libwayland), Cocoa/AppKit on macOS
+- **Five backends** — framebuffer (no X11/Wayland), XCB + SHM under X11, pure Zig Wayland client (no libwayland), Cocoa/AppKit on macOS, Win32/GDI on Windows 10 1809+ (ConPTY)
 - **Pixel scaling** — `-Dscale=2` or `-Dscale=4` for HiDPI. Integer scaling, same font blob
 - **Double-buffered SHM** — tear-free rendering on X11 and Wayland
 - **Adaptive frame limiter** — reduces FPS under heavy output to avoid wasting CPU
@@ -37,10 +40,10 @@ Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=Rel
 - **CJK wide characters** — double-width rendering with boundary repair
 - **59,635 glyphs** — UFO bitmap font + Nerd Fonts icons, embedded at compile time
 - **XKB keyboard layout** — any X11/Wayland layout (US, JP, DE, FR, etc.)
-- **Input method** — native AppKit input methods on macOS, XIM under X11, and text-input-v3 under Wayland (fcitx5, ibus, etc.)
+- **Input method** — native AppKit input methods on macOS, XIM under X11, text-input-v3 under Wayland (fcitx5, ibus, etc.), and the system IMM/TSF IME on Windows
 - **Inline pre-edit (IME composition)** — macOS AppKit and Wayland `text-input-v3` preedit; composition text is rendered at the cursor position with reverse-video / underline / highlight feedback from the IME
 - **OSC 8 hyperlinks** — parsed and stored; click-to-open is not yet implemented
-- **OSC 52 clipboard** — copy to system clipboard via pbcopy on macOS or xclip/wl-copy on Linux (disabled by default for security)
+- **OSC 52 clipboard** — copy to system clipboard via pbcopy on macOS, xclip/wl-copy on Linux, or the Win32 clipboard API on Windows (disabled by default for security)
 
 ### Performance
 
@@ -55,12 +58,23 @@ Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=Rel
 
 Requires Zig 0.17.0. See the [migration notes](docs/zig-0.17-migration.md) for changes and verification results.
 
-|  | fbdev | X11 | Wayland |
-|---|---|---|---|
-| Binary (stripped, with 59K-glyph font) | ~3 MB | ~3 MB | ~3 MB |
-| Runtime dependencies | none | libxcb, libxcb-shm, libxcb-xkb, libxkbcommon, libxcb-imdkit | libxkbcommon |
+|  | fbdev | X11 | Wayland | Windows |
+|---|---|---|---|---|
+| Binary (stripped, with 59K-glyph font) | ~3 MB | ~3 MB | ~3 MB | ~3.6 MB |
+| Runtime dependencies | none | libxcb, libxcb-shm, libxcb-xkb, libxkbcommon, libxcb-imdkit | libxkbcommon | none (Windows 10 1809+) |
 
 ### Quick Start
+
+On Windows 10 1809 or later:
+
+```sh
+zig build -Dbackend=windows -Doptimize=ReleaseFast
+.\zig-out\bin\zt.exe
+```
+
+The Windows build is GUI-subsystem, so no console window appears. The default
+shell is `cmd.exe`; build with `"-Dshell=powershell.exe"` for PowerShell. Windows
+10 1809 (build 17763) or newer is required because zt uses ConPTY.
 
 On macOS, download `zt-aarch64-macos.zip` for Apple Silicon or
 `zt-x86_64-macos.zip` for Intel from the [latest release](https://github.com/midasdf/zt/releases/latest),
@@ -98,8 +112,11 @@ Add `-Dstrip=true` to remove debug symbols.
 # HiDPI (2x or 4x pixel scaling)
 zig build -Dbackend=x11 -Dscale=2 -Doptimize=ReleaseFast
 
-# Custom shell (default: /bin/sh)
+# Custom shell (default: /bin/sh, or cmd.exe on Windows)
 zig build -Dbackend=x11 -Dshell=/bin/fish -Doptimize=ReleaseFast
+
+# Windows: PowerShell and HiDPI text
+zig build -Dbackend=windows "-Dshell=powershell.exe" -Dscale=2 -Doptimize=ReleaseFast
 
 # 60fps cap (battery saving)
 zig build -Dbackend=x11 -Dmax_fps=60 -Doptimize=ReleaseFast
@@ -189,6 +206,23 @@ keyboard modifiers, large pastes, resizing, and closing. Physical keyboard,
 IME candidate selection, and display changes require manual checks; see
 [the macOS QA checklist](docs/macos-qa.md).
 
+### Windows Backend
+
+Native Win32 window with a GDI DIB framebuffer and a ConPTY child process. No
+GTK/Qt, no bundled DLLs, and no GPU requirement: the window is a plain
+`WS_OVERLAPPEDWINDOW` and damaged rows are blitted with `BitBlt`.
+
+- Requires Windows 10 1809 (build 17763) or newer for `CreatePseudoConsole`.
+- Release builds produce `zt-x86_64-windows.exe` (GUI subsystem, no console window).
+- Default shell: `cmd.exe`; use `"-Dshell=powershell.exe"` or another executable.
+- `-e <command> [args...]` runs a one-shot command (the window closes when it exits).
+- Clipboard copy/paste uses the Win32 clipboard (`Ctrl+Shift+C` / `Ctrl+Shift+V`);
+  `Ctrl+Shift+N` opens another zt process.
+- The system IME (Microsoft IME, Sogou, …) is positioned at the terminal cursor;
+  composition is displayed by the IME, not inline.
+- HiDPI: pass `-Dscale=2` (or `-Dscale=4`) for larger glyphs. The process is
+  per-monitor DPI aware.
+
 ## Status
 
 | Backend | Status |
@@ -197,6 +231,7 @@ IME candidate selection, and display changes require manual checks; see
 | X11 | Stable — primary development target |
 | Wayland | Works — IME and basic usage tested |
 | macOS | Supported — Cocoa, Apple Silicon and Intel; macOS 14+ |
+| Windows | Supported — Win32/GDI + ConPTY; Windows 10 1809+ |
 
 ## Configuration
 
@@ -263,13 +298,13 @@ zig build -Dbackend=x11 -Dfont=TopazNG_Code-Regular.ttf -Doptimize=ReleaseFast
 ## Architecture
 
 ```
-epoll event loop (single-threaded)
-├── PTY reader → VT parser → cell grid
+epoll / kqueue / Win32 message loop (single-threaded)
+├── PTY reader (POSIX fd / ConPTY pipe thread) → VT parser → cell grid
 │   ├── ASCII fast path (SIMD bulk write)
 │   └── UTF-8 fast path (direct decode)
-├── Input (evdev / XKB+XIM / XKB+text-input-v3)
+├── Input (evdev / XKB+XIM / XKB+text-input-v3 / Win32 IMM)
 ├── Renderer (dirty-region, frame-limited)
-├── Backend (fbdev mmap / X11 SHM / Wayland wl_shm)
+├── Backend (fbdev mmap / X11 SHM / Wayland wl_shm / Win32 GDI DIB)
 └── Signals, timers, write buffering
 ```
 
@@ -277,16 +312,17 @@ epoll event loop (single-threaded)
 
 | Keys | Action |
 |------|--------|
-| `Ctrl+Shift+C` | Copy selection to clipboard (X11/Wayland) |
-| `Ctrl+Shift+V` | Paste from clipboard (X11/Wayland) |
+| `Ctrl+Shift+C` | Copy selection to clipboard (X11/Wayland/Windows) |
+| `Ctrl+Shift+V` | Paste from clipboard (X11/Wayland/Windows) |
+| `Ctrl+Shift+N` | Open a new window (Windows) |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll scrollback one page up / down (active ring: main or alt-screen) |
 | `Shift+Home` / `Shift+End` | Jump to scrollback top / live bottom (active ring) |
-| Left-click drag | Select text |
+| Left-click drag | Select text (copies on release) |
 | Mouse wheel | Scrollback (main screen) / arrow keys (alt screen, default) / scrollback (alt screen with `-Dalt_screen_wheel_scrollback=true`) / app (mouse capture) |
 
 ## Tested Applications
 
-vim, nano, micro, less, bat, top, btop, man, git, eza, tree, ripgrep, python3 REPL, fish, Claude Code
+vim, nano, micro, less, bat, top, btop, man, git, eza, tree, ripgrep, python3 REPL, fish, cmd.exe, PowerShell, Claude Code
 
 Some applications may have minor rendering issues due to missing features (see below).
 
@@ -294,9 +330,9 @@ Some applications may have minor rendering issues due to missing features (see b
 
 - **Scrollback** — fixed capacity, set at compile time via `-Dscrollback_lines=N` (default 10000, 0 disables). No reflow on column resize, no selection of scrollback rows yet. Both the main screen and the alt screen have their own session-scoped scrollback rings: the alt ring is created on enter-alt and freed on leave-alt, so `less`/`vim`/`codex` history is scoped to that session and never pollutes the main ring.
 - **Mouse wheel** — scrolls scrollback in main screen; translates to arrow keys for `less`/`vim` in alt screen (default); scrolls the alt-screen ring when `-Dalt_screen_wheel_scrollback=true` is set at build time (opt-in for `codex`-style sessions); passes through to apps with mouse capture (`mouse_mode != .none`).
-- **No clipboard paste on fbdev** — X11/Wayland support Ctrl+Shift+V
+- **No clipboard paste on fbdev** — X11/Wayland/Windows support Ctrl+Shift+V
 - **Bitmap rendering only** — single embedded blob (1-bit, fixed 8×16 cell), no antialiasing, no runtime system font lookup or fallback. A custom BDF or TTF can be embedded at build time via `-Dfont` (experimental, see [Font](#custom-fonts-experimental))
-- **No X11 inline pre-edit display** — XIM uses `PreeditNothing`, so the IME handles composition display
+- **No X11 inline pre-edit display** — XIM uses `PreeditNothing`, so the IME handles composition display. On Windows the system IME also draws composition at the cursor; zt does not render an inline pre-edit overlay there yet.
 - **No ligatures**
 - **No sixel/image protocol**
 - **Blink attribute** — parsed but not visually rendered

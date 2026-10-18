@@ -153,6 +153,31 @@ jobs:
           name: zt-aarch64-linux-wayland
           path: zig-out/bin/zt
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip" -OutFile zig.zip
+          Expand-Archive zig.zip -DestinationPath .
+          "$PWD\zig-x86_64-windows-0.17.0" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build
+        run: zig build -Dbackend=windows -Doptimize=ReleaseFast -Dstrip=true
+
+      - name: Stage artifact
+        shell: pwsh
+        run: Copy-Item zig-out/bin/zt.exe zt-x86_64-windows.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zt-x86_64-windows
+          path: zt-x86_64-windows.exe
+
   build-macos:
     strategy:
       fail-fast: false
@@ -187,7 +212,7 @@ jobs:
             zt-${{ matrix.arch }}-macos.zip
 
   release:
-    needs: [build-x86_64-x11, build-x86_64-wayland, build-aarch64-x11, build-aarch64-wayland, build-macos]
+    needs: [build-x86_64-x11, build-x86_64-wayland, build-aarch64-x11, build-aarch64-wayland, build-windows, build-macos]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -203,6 +228,7 @@ jobs:
           mv zt-aarch64-linux-wayland/zt zt-aarch64-linux-wayland.bin
           mv zt-aarch64-macos/* .
           mv zt-x86_64-macos/* .
+          mv zt-x86_64-windows/* .
           chmod +x zt-*.bin
 
       - name: Create or update release
@@ -229,5 +255,6 @@ jobs:
             zt-x86_64-macos.bin \
             zt-aarch64-macos.zip \
             zt-x86_64-macos.zip \
+            zt-x86_64-windows.exe \
             --clobber
           gh release edit "${TAG}" --draft=false --latest

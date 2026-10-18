@@ -5,12 +5,18 @@ const posix = @import("posix.zig");
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 comptime {
-    if (!is_macos and !is_linux) {
-        @compileError("PTY support is only implemented for Linux and macOS");
+    if (!is_macos and !is_linux and !is_windows) {
+        @compileError("PTY support is only implemented for Linux, macOS, and Windows");
     }
 }
+
+/// The public PTY interface is selected at comptime. Native Windows uses
+/// ConPTY (see pty_windows.zig); POSIX platforms share the forkpty-style
+/// implementation below.
+pub const Pty = if (is_windows) @import("pty_windows.zig").Pty else PosixPty;
 
 const c = if (is_macos) @import("c_pty_macos") else struct {};
 
@@ -58,7 +64,7 @@ fn makeExecArgv(
     return exec_ptrs;
 }
 
-pub const Pty = struct {
+const PosixPty = struct {
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
 
@@ -423,6 +429,7 @@ test "Pty: exec argv builder keeps all arguments" {
 }
 
 test "Pty: spawn and read echo output" {
+    if (is_windows) return error.SkipZigTest;
     // Skip when /dev/ptmx (Linux) is missing or invisible (e.g. restricted CI/sandbox).
     var pty = if (is_macos) try Pty.spawn(80, 24, "/bin/echo", null) else Pty.spawn(80, 24, "/bin/echo", null) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
